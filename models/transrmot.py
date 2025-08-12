@@ -65,6 +65,10 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        self.losses.append('confidence') 
+        self.losses.append('daedalus')
+        self.losses.append('coolshrink')
+        self.losses.append('reborn')
 
     def initialize_for_single_clip(self, gt_instances: List[Instances], dataset_name=None):
         self.gt_instances = gt_instances
@@ -111,6 +115,11 @@ class ClipMatcher(SetCriterion):
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
             'refers': self.loss_refers,
+            'matching': self.loss_matching,
+            'confidence': self.loss_confidence,
+            'daedalus': self.loss_daedalus,
+            "coolshrink": self.loss_coolshrink,
+            "reborn": self.loss_reborn,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, gt_instances, indices, num_boxes, **kwargs)
@@ -183,6 +192,184 @@ class ClipMatcher(SetCriterion):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
 
         return losses
+    def loss_matching(self, outputs, gt_instances: List[Instances], indices, num_boxes, track_instances, **kwargs):
+        """
+        Compute a loss on the matching process by re‐computing the cost matrix
+        (combining classification cost, L1 cost and giou cost) and then extracting
+        the matching cost for the true assignments. For an adversarial attack,
+        we want to *maximize* these matching costs, so we define the loss as the negative mean.
+        """
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+        
+        # Flatten predictions:
+        if self.focal_loss:
+            out_prob = outputs["pred_logits"].flatten(0, 1).sigmoid()
+        else:
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
+        
+        # Concatenate ground truth labels and boxes:
+        if isinstance(gt_instances[0], Instances):
+            tgt_ids = torch.cat([gt.labels for gt in gt_instances])
+            tgt_bbox = torch.cat([gt.boxes for gt in gt_instances])
+        else:
+            tgt_ids = torch.cat([v["labels"] for v in gt_instances])
+            tgt_bbox = torch.cat([v["boxes"] for v in gt_instances])
+        tgt_bbox = tgt_bbox.to(out_bbox.device)
+        
+        # Compute classification cost:
+        if self.focal_loss:
+            alpha = 0.25
+            gamma = 2.0
+            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
+            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
+            cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+        else:
+            cost_class = -out_prob[:, tgt_ids]
+        
+        # Compute L1 cost:
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        # Compute generalized IoU cost:
+        cost_giou = -box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(out_bbox),
+            box_ops.box_cxcywh_to_xyxy(tgt_bbox))
+        
+        # Use provided weights if any (or default to 1.0)
+        weight_bbox = self.weight_dict.get("cost_bbox", 5.0)
+        weight_class = self.weight_dict.get("cost_class", 1.0)
+        weight_giou = self.weight_dict.get("cost_giou", 3.0)
+        # Combine them
+        C = weight_bbox * cost_bbox + weight_class * cost_class + weight_giou * cost_giou
+        C = C.view(bs, num_queries, -1)  # shape: [bs, num_queries, num_targets]
+        
+        # For simplicity assume that we're processing a single image (bs==1).
+        # indices[0] should be a tuple (pred_idx, gt_idx) for the matched pairs.
+        pred_idx, gt_idx = indices[0]
+        pred_idx = pred_idx.to(out_bbox.device)
+        gt_idx = gt_idx.to(out_bbox.device)
+        
+        # Gather the cost values for the true matches:
+        matched_costs = C[0, pred_idx, gt_idx]  # shape: [num_matches]
+        
+        # For an adversarial loss, you could choose to maximize these costs.
+        loss_matching = matched_costs.mean()
+        
+        return {'loss_matching': loss_matching}
+
+    def loss_confidence(self, outputs, gt_instances, indices, num_boxes, track_instances, **kwargs):
+        src_logits = outputs['pred_logits']  # [B, num_queries, num_classes+1]
+        
+        background_logits = src_logits[..., -1]  # [B, num_queries]
+        
+        target = torch.zeros_like(background_logits)  # 默认全是背景
+        idx = self._get_src_permutation_idx(indices)
+        
+        for (src_idx, tgt_idx) in indices:
+            target[0, src_idx[tgt_idx != -1]] = 1  # tgt_idx=-1表示背景
+        
+        conf_loss = F.binary_cross_entropy_with_logits(
+            -background_logits,  # 取负,转换语义
+            target,
+            reduction='none'
+        )
+        
+        losses = {'loss_conf': conf_loss.sum() / num_boxes}
+        return losses
+    
+    def loss_daedalus(self, outputs, gt_instances=None, indices=None, num_boxes=None, track_instances=None, cls_set=None, **kwargs):
+        """
+        Daedalus f3 loss: ① Confidence→1; ② bbox area→0
+
+        outputs['pred_logits']: [B, Q, C]
+        outputs['pred_boxes']  : [B, Q, 4]  (cx, cy, w, h) ∈ [0,1]
+        """
+        logits  = outputs['pred_logits'][0]          # [Q, C]
+        boxes   = outputs['pred_boxes'][0]           # [Q, 4]
+        scores  = logits.sigmoid().max(-1).values    # per-query confidence
+
+        if cls_set is not None:
+            labels = logits.sigmoid().argmax(-1)     # predicted class labels
+            keep   = torch.zeros_like(scores, dtype=torch.bool)
+            for cls_id in cls_set:
+                keep = keep | (labels == cls_id)
+            scores = scores[keep]
+            boxes  = boxes[keep]
+
+        if scores.numel() == 0:
+            # If no boxes are selected, return zero loss for stability
+            return {'loss_daedalus': torch.tensor(0., device=boxes.device)}
+
+        # ① Confidence loss: (score - 1)^2
+        conf_loss = (scores - 1).pow(2)
+
+        # ② Area loss: (w * h)^2; assumes boxes are normalized [0,1]
+        area = (boxes[:, 2] * boxes[:, 3]).pow(2)
+
+        loss = torch.mean(conf_loss + area)
+        return {'loss_daedalus': loss}
+    
+    def loss_coolshrink(
+            self, outputs, gt_instances, indices, num_boxes, track_instances,
+            cool_margin=0.0, area_margin=0.0, cls_set=None, **kwargs):
+        """
+        Cooling-Shrinking loss:
+          ① Cooling : Let the confidence of the positive sample  → cool_margin 0
+          ② Shrink  : Let the positive sample bbox area → area_margin 0
+        """
+        # 只看当前 batch==0（MOTR 一帧一 batch）
+        logits = outputs["pred_logits"][0]      # [Q, C]
+        boxes  = outputs["pred_boxes"][0]       # [Q, 4]  (cx,cy,w,h)
+
+        # 取匹配到 GT 的 query index
+        src_idx, tgt_idx = indices[0]
+        pos_logits = logits[src_idx]            # [N_pos, C]
+        pos_boxes  = boxes[src_idx]             # [N_pos, 4]
+
+        # ① Cooling：For each positive sample, let the prob of the corresponding GT class close to 0
+        pos_scores = pos_logits.sigmoid().max(-1).values
+        cool_loss  = (pos_scores - cool_margin).pow(2)   # MSE
+
+        # ② Shrinking：area square
+        area = (pos_boxes[:, 2] * pos_boxes[:, 3]).pow(2)
+        shrink_loss = (area - area_margin).pow(2)
+
+        loss = (cool_loss + shrink_loss).mean()
+        return {"loss_coolshrink": loss}
+    def loss_reborn(self, outputs, gt_instances, indices, num_boxes, track_instances, **kwargs):
+        """
+        Encourage inactive tracks (obj_idxes == -1) to become active (assigned to GT)
+        and have their predicted boxes close to GT boxes.
+        """
+        if track_instances is None or len(track_instances) == 0:    
+            return {"loss_reborn": torch.tensor(0., device=outputs['pred_logits'].device)}
+        
+        inactive_idxes = (track_instances.obj_idxes == -1)
+        if inactive_idxes.sum() == 0:
+            return {"loss_reborn": torch.tensor(0., device=track_instances.pred_logits.device)}
+
+        pred_logits = track_instances.pred_logits[inactive_idxes]  # [N_inactive, num_classes]
+        pred_boxes = track_instances.pred_boxes[inactive_idxes]    # [N_inactive, 4]
+        pred_scores = pred_logits.sigmoid().max(-1).values         # [N_inactive]
+
+        # Encourage confidence to be high (close to 1)
+        conf_loss = (1 - pred_scores).pow(2).mean()
+
+        # --- Bounding box loss ---
+        # Get all GT boxes for this frame
+        gt_boxes = gt_instances[0].boxes.to(pred_boxes.device)     # [N_gt, 4]
+        if len(gt_boxes) > 0 and len(pred_boxes) > 0:
+            # For each inactive track, find the closest GT box (L1 distance)
+            dists = torch.cdist(pred_boxes, gt_boxes, p=1)         # [N_inactive, N_gt]
+            min_dists, min_idxs = dists.min(dim=1)
+            matched_gt_boxes = gt_boxes[min_idxs]                  # [N_inactive, 4]
+            box_loss = F.l1_loss(pred_boxes, matched_gt_boxes, reduction='mean')
+        else:
+            box_loss = torch.tensor(0., device=pred_boxes.device)
+
+        # Combine losses (you can weight them as needed)
+        #reborn_loss = conf_loss + (box_loss/200)
+        reborn_loss = conf_loss
+        return {"loss_reborn": reborn_loss}
 
     def loss_refers(self,  outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes):
 
@@ -372,8 +559,9 @@ class RuntimeTrackerBase(object):
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
-    def __init__(self):
+    def __init__(self, adversarial=False):
         super().__init__()
+        self.adversarial = adversarial
 
     @torch.no_grad()
     def forward(self, track_instances: Instances, target_size) -> Instances:
@@ -388,17 +576,43 @@ class TrackerPostProcess(nn.Module):
         out_bbox = track_instances.pred_boxes
         out_refers = track_instances.pred_refers
 
-        prob = out_logits.sigmoid()
-        # prob = out_logits[...,:1].sigmoid()
-        scores, labels = prob.max(-1)
-        refers = out_refers.sigmoid().max(-1)[0]
 
-        # convert to [x0, y0, x1, y1] format
-        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        # and from relative [0, 1] to absolute [0, height] coordinates
-        img_h, img_w = target_size
-        scale_fct = torch.Tensor([img_w, img_h, img_w, img_h]).to(boxes)
-        boxes = boxes * scale_fct[None, :]
+        if self.adversarial:
+            prob = out_logits.sigmoid()
+            scores, labels = prob.max(-1)
+            refers = out_refers.sigmoid().max(-1)[0]
+            
+            # convert to [x0, y0, x1, y1] format
+            boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+            # and from relative [0, 1] to absolute [0, height] coordinates
+            img_h, img_w = target_size
+            scale_fct = torch.tensor([img_w, img_h, img_w, img_h], 
+                                   dtype=boxes.dtype, device=boxes.device)
+            boxes = boxes * scale_fct[None, :]
+        else:
+            with torch.no_grad():
+                prob = out_logits.sigmoid()
+                scores, labels = prob.max(-1)
+                refers = out_refers.sigmoid().max(-1)[0]
+                
+                # convert to [x0, y0, x1, y1] format
+                boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+                # and from relative [0, 1] to absolute [0, height] coordinates
+                img_h, img_w = target_size
+                scale_fct = torch.tensor([img_w, img_h, img_w, img_h], 
+                                       dtype=boxes.dtype, device=boxes.device)
+                boxes = boxes * scale_fct[None, :]
+        # prob = out_logits.sigmoid()
+        # # prob = out_logits[...,:1].sigmoid()
+        # scores, labels = prob.max(-1)
+        # refers = out_refers.sigmoid().max(-1)[0]
+
+        # # convert to [x0, y0, x1, y1] format
+        # boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        # # and from relative [0, 1] to absolute [0, height] coordinates
+        # img_h, img_w = target_size
+        # scale_fct = torch.Tensor([img_w, img_h, img_w, img_h]).to(boxes)
+        # boxes = boxes * scale_fct[None, :]
 
         track_instances.boxes = boxes
         track_instances.scores = scores
@@ -439,6 +653,7 @@ class TransRMOT(nn.Module):
         self.refer_embed = nn.Linear(hidden_dim, 1) # this is referring branch
         self.num_feature_levels = num_feature_levels
         self.use_checkpoint = use_checkpoint
+        self.adversarial = adversarial
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
         if num_feature_levels > 1:
@@ -681,21 +896,30 @@ class TransRMOT(nn.Module):
         return out
     
     def _post_process_single_image(self, frame_res, track_instances, is_last):
-        with torch.no_grad():
-            if self.training:
-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
-            else:
-                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
-
+        # with torch.no_grad():
+        #     if self.training:
+        #         track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
+        #     else:
+        #         track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+        if self.adversarial:
+            #print("_post_process_single_image in Adversarial inference mode.")
+            track_scores = frame_res["pred_logits"][0].sigmoid().max(-1).values if self.training else frame_res["pred_logits"][0, :, 0].sigmoid()
+        else:
+            with torch.no_grad():
+                track_scores = frame_res["pred_logits"][0].sigmoid().max(-1).values if self.training else frame_res["pred_logits"][0, :, 0].sigmoid()
         track_instances.scores = track_scores
         track_instances.pred_logits = frame_res['pred_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
         track_instances.pred_refers = frame_res['pred_refers'][0]
         track_instances.output_embedding = frame_res['hs'][0]
-        if self.training:
+        if self.training and not self.adversarial:
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res)
+        elif self.adversarial:
+            frame_res['track_instances'] = track_instances
+            track_instances = self.criterion.match_for_single_frame(frame_res)
+            self.track_base.update(track_instances)
         else:
             # each track will be assigned an unique global id by the track base.
             self.track_base.update(track_instances)
@@ -715,28 +939,56 @@ class TransRMOT(nn.Module):
             frame_res['track_instances'] = None
         return frame_res
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def inference_single_image(self, img, sentence, ori_img_size, track_instances=None):
+        
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
-        if track_instances is None:
-            track_instances = self._generate_empty_tracks()
-        res = self._forward_single_image(img, track_instances=track_instances, sentences=sentence)
-        res = self._post_process_single_image(res, track_instances, False)
+        track_instances = track_instances or self._generate_empty_tracks()
+
+        if self.adversarial:
+            #print("Adversarial inference mode.")
+            res = self._forward_single_image(img, track_instances)
+            res = self._post_process_single_image(res, track_instances, False)
+        else:
+            with torch.no_grad():
+                res = self._forward_single_image(img, track_instances)
+                res = self._post_process_single_image(res, track_instances, False)
+
+         # --- ADD THIS: Compute losses even during inference ---
+        #self.criterion.match_for_single_frame(res)
 
         track_instances = res['track_instances']
         track_instances = self.post_process(track_instances, ori_img_size)
-        ret = {'track_instances': track_instances}
+        ret = {'track_instances': track_instances, "track_losses": self.criterion.losses_dict.copy()}
         if 'ref_pts' in res:
             ref_pts = res['ref_pts']
             img_h, img_w = ori_img_size
             scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
             ref_pts = ref_pts * scale_fct[None]
             ret['ref_pts'] = ref_pts
+    
         return ret
+        # if not isinstance(img, NestedTensor):
+        #     img = nested_tensor_from_tensor_list(img)
+        # if track_instances is None:
+        #     track_instances = self._generate_empty_tracks()
+        # res = self._forward_single_image(img, track_instances=track_instances, sentences=sentence)
+        # res = self._post_process_single_image(res, track_instances, False)
+
+        # track_instances = res['track_instances']
+        # track_instances = self.post_process(track_instances, ori_img_size)
+        # ret = {'track_instances': track_instances}
+        # if 'ref_pts' in res:
+        #     ref_pts = res['ref_pts']
+        #     img_h, img_w = ori_img_size
+        #     scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
+        #     ref_pts = ref_pts * scale_fct[None]
+        #     ret['ref_pts'] = ref_pts
+        # return ret
 
     def forward(self, data: dict):
-        if self.training:
+        if self.training and not self.adversarial:
             self.criterion.initialize_for_single_clip(data['gt_instances'], data['dataset_name'])
         frames = data['imgs'] # list of Tensor.
         sentences = data['sentences']
@@ -793,10 +1045,22 @@ class TransRMOT(nn.Module):
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
             outputs['pred_refers'].append(frame_res['pred_refers'])
 
-        if not self.training:
-            outputs['track_instances'] = track_instances
-        else:
-            outputs['losses_dict'] = self.criterion.losses_dict
+        # if not self.training:
+        #     outputs['track_instances'] = track_instances
+        # else:
+        #     outputs['losses_dict'] = self.criterion.losses_dict
+        # return outputs
+        if self.adversarial and not self.training:
+            #print("************************ Return track instances in Adversarial inference mode.")
+            outputs["track_instances"] = track_instances
+        
+        if self.training and not self.adversarial:
+            outputs["losses_dict"] = self.criterion.losses_dict
+        
+        if not self.training and not self.adversarial:
+            #print("************************ Return track instances in normal inference mode.")
+            outputs["track_instances"] = track_instances
+
         return outputs
 
 
@@ -824,6 +1088,9 @@ def build(args):
                             'frame_{}_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             'frame_{}_loss_refer'.format(i): args.refer_loss_coef,
+                            'frame_{}_loss_conf'.format(i): args.conf_loss_coef,
+                            'frame_{}_loss_daedalus'.format(i): args.daedalus_loss_coef,
+                            'frame_{}_loss_coolshrink'.format(i): args.coolshrink_loss_coef,
                             })
 
     # TODO this is a hack
@@ -841,7 +1108,7 @@ def build(args):
             weight_dict.update({"frame_{}_track_loss_ce".format(i): args.cls_loss_coef})
     else:
         memory_bank = None
-    losses = ['labels', 'boxes', 'refers']
+    losses = ['labels', 'boxes', 'refers', 'matching', 'confidence', 'daedalus', 'coolshrink']
     criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
     criterion.to(device)
     postprocessors = {}
@@ -858,5 +1125,6 @@ def build(args):
         two_stage=args.two_stage,
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
+        adversarial=args.adversarial
     )
     return model, criterion, postprocessors
