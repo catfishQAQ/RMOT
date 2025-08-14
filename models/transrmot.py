@@ -630,7 +630,7 @@ def _get_clones(module, N):
 
 class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False):
+             aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, adversarial=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -948,11 +948,11 @@ class TransRMOT(nn.Module):
 
         if self.adversarial:
             #print("Adversarial inference mode.")
-            res = self._forward_single_image(img, track_instances)
+            res = self._forward_single_image(img, track_instances, sentence)
             res = self._post_process_single_image(res, track_instances, False)
         else:
             with torch.no_grad():
-                res = self._forward_single_image(img, track_instances)
+                res = self._forward_single_image(img, track_instances, sentence)
                 res = self._post_process_single_image(res, track_instances, False)
 
          # --- ADD THIS: Compute losses even during inference ---
