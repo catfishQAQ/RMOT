@@ -96,7 +96,14 @@ class PGDAttackerOurs:
                 self.model.criterion.losses_dict.clear()
 
             frame = self.model.criterion._current_frame_idx
-            out = self.model.inference_single_image(adv_img, img_hw, track_instances)
+
+            adv_img_copy = adv_img.clone()
+            if hasattr(self.model, 'sentence') and self.model.sentence:
+            # 如果模型有预设的语句
+                out = self.model.inference_single_image(adv_img_copy, img_hw, track_instances)
+            else:
+                sentences = ["car"]  
+                out = self.model.inference_single_image(adv_img_copy, sentences, img_hw, track_instances)
 
             loss_bbox = out["track_losses"][f"frame_{frame}_loss_bbox"] * self.loss_weights['bbox']
             loss_ce = out["track_losses"][f"frame_{frame}_loss_ce"] * self.loss_weights['ce']
