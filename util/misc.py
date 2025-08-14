@@ -31,7 +31,14 @@ from torch import Tensor
 import torchvision
 if float(torchvision.__version__[:3]) < 0.5:
     import math
-    from torchvision.ops.misc import _NewEmptyTensorOp
+    try:
+        from torchvision.ops.misc import _NewEmptyTensorOp
+    except ImportError:
+        try:
+            from torchvision.ops import _NewEmptyTensorOp
+        except ImportError:
+
+            _NewEmptyTensorOp = None
     def _check_size_scale_factor(dim, size, scale_factor):
         # type: (int, Optional[List[int]], Optional[float]) -> None
         if size is None and scale_factor is None:
@@ -348,7 +355,8 @@ def nested_tensor_from_tensor_list(tensor_list: List[Tensor], size_divisibility:
         tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
         mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
         for img, pad_img, m in zip(tensor_list, tensor, mask):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            pad_img = pad_img.clone()  # 创建副本避免视图问题
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]] = img
             m[: img.shape[1], :img.shape[2]] = False
     else:
         raise ValueError('not supported')
