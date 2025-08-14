@@ -115,6 +115,7 @@ class RMOTAdversarialDetector(object):
     """Adversarial attack detector for RMOT"""
     
     def __init__(self, args, device='cuda'):
+        
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if not hasattr(args, 'local_self_attn'):
@@ -462,7 +463,7 @@ def main():
     parser = get_args_parser()
     
     # Add RMOT-specific arguments
-    parser.add_argument('--seq_num', type=str, default='0005,1.json',
+    parser.add_argument('--seq_num', type=str, default='0005,black-cars-in-the-left.json',
                        help='Sequence number and expression file (e.g., 0005,1.json)')
     parser.add_argument('--ref_threshold', type=float, default=0.5,
                        help='Threshold for reference expression matching score')
@@ -470,13 +471,12 @@ def main():
     # Adversarial attack arguments (if not already present)
     parser.add_argument('--attack', action='store_true',
                        help='Enable adversarial attack')
-    parser.add_argument('--adversarial', action='store_true',
-                       help='Enable adversarial mode')
-    parser.add_argument('--attack_type', type=str, default='pgd',
-                       choices=['pgd', 'fgsm', 'mifgsm', 'ff'],
+    parser.add_argument('--attack_type', type=str, default='phy_ours_1',
+                       choices=['phy_ours_1', 'phy_ours_2', 'phy_ours_3','phy_ff', 'phy_daedalus', 'phy_shrink',
+                       'ours_1', 'ours_2', 'ours_3','ff', 'daedalus', 'shrink'],
                        help='Type of adversarial attack')
-    parser.add_argument('--attack_vector', type=str, default='feat',
-                       choices=['feat', 'cls', 'reg'],
+    parser.add_argument('--attack_vector', type=str, default='acoustic',
+                       choices=['acoustic', 'emi', 'feat', 'cls', 'reg'],
                        help='Attack vector to use')
     parser.add_argument('--attack_eps', type=float, default=8,
                        help='Epsilon for adversarial attack (0-255 scale)')
@@ -531,3 +531,39 @@ def main():
 
 if __name__ == '__main__':
     main()
+'''python adv_attack.py --meta_arch rmot --dataset_file e2e_rmot --epoch 200 --with_box_refine --lr_drop 100 --lr 2e-4 --lr_backbone 2e-5 --batch_size 1 --sample_mode random_interval --sample_interval 1 --sampler_steps 50 90 150 --sampler_lengths 2 3 4 5 --update_query_pos --merger_dropout 0 --dropout 0 --random_drop 0.1 --fp_ratio 0.3 --query_interaction_layer QIM --extra_track_attn --resume exps/default/checkpoint0099.pth --output_dir exps/default --visualization'''
+'''python adv_attack.py \
+    --meta_arch rmot \
+    --dataset_file e2e_rmot \
+    --epoch 200 \
+    --with_box_refine \
+    --lr_drop 100 \
+    --lr 2e-4 \
+    --lr_backbone 2e-5 \
+    --batch_size 1 \
+    --sample_mode random_interval \
+    --sample_interval 1 \
+    --sampler_steps 50 90 150 \
+    --sampler_lengths 2 3 4 5 \
+    --update_query_pos \
+    --merger_dropout 0 \
+    --dropout 0 \
+    --random_drop 0.1 \
+    --fp_ratio 0.3 \
+    --query_interaction_layer QIM \
+    --extra_track_attn \
+    --resume exps/default/checkpoint0099.pth \
+    --output_dir exps/default \
+    --visualization \
+    --attack \
+    --adversarial \
+    --attack_type ours_1 \
+    --attack_vector feat \
+    --attack_eps 8 \
+    --attack_alpha 2 \
+    --attack_steps 10 \
+    --attack_start 5 \
+    --attack_step 1 \
+    --adv_weight_set "1" \
+    --seq_num "0005,black-cars-in-the-left.json" \
+    --ref_threshold 0.5'''
